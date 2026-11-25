@@ -1,120 +1,204 @@
-import time, select, threading, time, select, configparser, ssl, os, certifi, socket, warnings, hashlib, subprocess
+"""
+Local HTTP CONNECT → TLS(SNI) → remote stunnel host.
+
+Fixes vs legacy:
+  - SSLContext configured *before* wrap_socket
+  - CONNECT / host:port via http_util (IPv6-safe)
+  - Certificate policy via [ssl] (pin / hostname / none)
+"""
+from __future__ import annotations
+
+import configparser
+import hashlib
+import os
+import select
+import socket
+import subprocess
+import threading
+import time
+import warnings
+
+from http_util import parse_connect_request, parse_host_port
+from tls_util import TlsSettings, wrap_socket_client
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-class Tunnel():
-    def __init__(self):
+
+class Tunnel:
+    def __init__(self, on_event=None):
         self.config = configparser.ConfigParser()
-        self.config.read_file(open('settings.ini'))
-        self.local_ip = self.config['settings']['local_ip']
-        self.listen_port = int(self.config['settings']['listen_port'])
+        with open("settings.ini", encoding="utf-8") as f:
+            self.config.read_file(f)
+        self.local_ip = self.config["settings"]["local_ip"]
+        self.listen_port = int(self.config["settings"]["listen_port"])
+        self.on_event = on_event
+        self._tls = TlsSettings.from_config(self.config)
+
+    def emit(self, msg):
+        print(msg)
+        self.logs(msg)
+        if self.on_event:
+            try:
+                self.on_event(msg)
+            except Exception:
+                pass
 
     def tunneling(self, client, stunnel_socket):
         connected = True
-        print("[*] Connection Established.")
-        while connected == True:
-            r, w, x = select.select([client, stunnel_socket], [], [client, stunnel_socket], 3)
+        self.emit("[*] Connection Established.")
+        while connected:
+            pending = []
+            try:
+                if hasattr(stunnel_socket, "pending") and stunnel_socket.pending() > 0:
+                    pending.append(stunnel_socket)
+            except Exception:
+                pass
+
+            if pending:
+                r, x = pending, []
+            else:
+                r, w, x = select.select(
+                    [client, stunnel_socket], [], [client, stunnel_socket], 3
+                )
             if x:
-                connected = False
                 break
+            if not r and not pending:
+                continue
             for i in r:
                 try:
                     data = i.recv(16384)
                     if not data:
                         connected = False
+                        break
                     if i is stunnel_socket:
-                        client.send(data)
+                        client.sendall(data)
                     else:
-                        stunnel_socket.send(data)
+                        stunnel_socket.sendall(data)
                 except KeyboardInterrupt:
                     print("Exited")
                     connected = False
                 except Exception as e:
-                    self.logs(f' {e}')
+                    self.emit(f"[!!!] {e}")
                     connected = False
-        client.close()
-        stunnel_socket.close()
-        self.logs('[*] Client disconnected')
-        print("[*] Client disconnected!")
+        try:
+            client.close()
+        except Exception:
+            pass
+        try:
+            stunnel_socket.close()
+        except Exception:
+            pass
+        self.emit("[*] Client disconnected")
 
     def destination(self, client, address):
-        print("[*] New Client connected!")
-        self.logs(f'[*] Client{address}received!')
+        self.emit(f"[*] New Client connected! {address}")
+        stunnel_socket = None
         try:
-            request = client.recv(9124).decode()
-            host = self.config['ssh']['host']
-            port = request.split(':')[-1].split()[0]
-            stunnel_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            stunnel_socket.connect((host, int(port)))
-            print(f'[TCP] connected to {host}:{port}')
-            self.logs(f'[TCP] connected to {host}:{port}')
-            SNI_HOST = self.config['sni']['server_name']
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS)
-            stunnel_socket = context.wrap_socket(stunnel_socket, server_hostname=str(SNI_HOST))
-            context.verify_mode = ssl.CERT_REQUIRED
-            context.load_verify_locations(cafile=os.path.relpath(certifi.where()),capath=None, cadata=None)
-            self.logs(f'[TCP] Handshaked successfully to {SNI_HOST}')
-            print(f'[TCP] Handshaked successfully to {SNI_HOST}')
-            self.logs(f"[TCP] Protocol :{stunnel_socket.version()}")
+            raw = b""
+            client.settimeout(30)
+            while b"\r\n\r\n" not in raw:
+                chunk = client.recv(4096)
+                if not chunk:
+                    client.close()
+                    return
+                raw += chunk
+                if len(raw) > 65536:
+                    raise ValueError("CONNECT request too large")
+
+            # Authority from CONNECT; TCP peer is always [ssh] host (stunnel front).
+            _req_host, port, _leftover = parse_connect_request(raw)
+            host = self.config["ssh"]["host"]
+            # Validate port even though we may ignore _req_host for stunnel fronting
+            if not (1 <= port <= 65535):
+                raise ValueError(f"invalid CONNECT port: {port}")
+
+            raw_sock = socket.create_connection((host, int(port)), timeout=20)
+            self.emit(f"[TCP] connected to {host}:{port}")
+
+            tls = TlsSettings.from_config(self.config)
+            stunnel_socket = wrap_socket_client(raw_sock, tls)
+            status = getattr(stunnel_socket, "_sni_injector_verify_status", "")
+            self.emit(f"[TCP] Handshaked SNI={tls.sni} | {status}")
+            self.emit(f"[TCP] Protocol: {stunnel_socket.version()}")
             try:
-                self.logs(f"Ciphersuite : {stunnel_socket.cipher()[0]}")
-                print(f"[*] Ciphersuite : {stunnel_socket.cipher()[0]}")
-            except:pass
-            self.logs(f"Peerprincipal: C={stunnel_socket.getpeercert()}")              
-            client.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                self.emit(f"[*] Ciphersuite: {stunnel_socket.cipher()[0]}")
+            except Exception:
+                pass
+
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             self.tunneling(client, stunnel_socket)
         except Exception as e:
-            self.logs(f"[!!!] {e}")
-            print(f"[Error] {e}")
+            self.emit(f"[Error] {e}")
+            try:
+                client.close()
+            except Exception:
+                pass
+            if stunnel_socket is not None:
+                try:
+                    stunnel_socket.close()
+                except Exception:
+                    pass
 
     def create_connection(self):
-        for res in socket.getaddrinfo(self.local_ip, self.listen_port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE):
-            af, socktype, proto, canonname, sa = res
+        listen_socket = None
+        for res in socket.getaddrinfo(
+            self.local_ip,
+            self.listen_port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+            0,
+            socket.AI_PASSIVE,
+        ):
+            af, socktype, proto, _canonname, sa = res
             try:
                 listen_socket = socket.socket(af, socktype, proto)
             except OSError as e:
-                self.logs(f"[!!!] {e}")
-                print(f"[Error] {e}")
-                exit(1)
+                self.emit(f"[Error] {e}")
+                raise SystemExit(1) from e
             try:
+                listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listen_socket.bind((self.local_ip, self.listen_port))
-                listen_socket.listen(1)
+                listen_socket.listen(64)
+                break
             except OSError as e:
-                self.logs(f"[!!!] {e}")
-                print(f"[Error] {e}")
+                self.emit(f"[Error] {e}")
                 listen_socket.close()
-                exit(1)
-                
-            self.logs(f'Waiting for incoming connection to : {self.local_ip}:{self.listen_port}\n')
-            print(f'Waiting for incoming connection to : {self.local_ip}:{self.listen_port}\n')
-            while 1==1:
-                try:
-                    client, address = listen_socket.accept()
-                    thread = threading.Thread(target=self.destination, args=(client, address)).start()
-                except KeyboardInterrupt:
-                    print("\n[*] Exiting...")  
-                    if os.path.exists("logs"):os.remove("logs")
-                    break
+                listen_socket = None
+                continue
+
+        if listen_socket is None:
+            self.emit("[Error] bind failed")
+            raise SystemExit(1)
+
+        self.emit(f"[*] Waiting on {self.local_ip}:{self.listen_port}")
+        self.emit(
+            f"[*] TLS policy: verify={self._tls.verify} "
+            f"(SNI spoof ≠ ECH / DPI obfuscation)"
+        )
+        while True:
+            try:
+                client, address = listen_socket.accept()
+                threading.Thread(
+                    target=self.destination, args=(client, address), daemon=True
+                ).start()
+            except KeyboardInterrupt:
+                print("\n[*] Exiting...")
+                if os.path.exists("logs"):
+                    os.remove("logs")
+                break
 
     def logs(self, log):
-        
-        #logtime = str(time.ctime()).split()[3]
-        #logfile = open('logs', 'a')
-        #logfile.write(f'[{logtime}] : {str(log)}\n')
-        
         logtime = str(time.ctime()).split()[3]
-        log_hash = hashlib.sha256(log.encode()).hexdigest()  # Compute SHA-256 hash of the log
-        with open('logs', 'a') as logfile:
-            logfile.write(f'[{logtime}] : {log_hash}\n')
-        
-        # Function to make the file hidden (Windows specific)
-        def make_hidden(file_path):
-            # Use attrib command to set the hidden attribute
-            subprocess.run(['attrib', '+h', file_path], shell=True)
-        
-        # Make 'logs' hidden after writing
-        make_hidden('logs')
+        log_hash = hashlib.sha256(log.encode()).hexdigest()
+        with open("logs", "a", encoding="utf-8") as logfile:
+            logfile.write(f"[{logtime}] : {log_hash}\n")
+        if os.name == "nt":
+            subprocess.run(
+                ["attrib", "+h", "logs"], shell=True, capture_output=True
+            )
 
 
-if __name__ == '__main__':
-    start = Tunnel()
-    start.create_connection()
+if __name__ == "__main__":
+    # sanity: ensure parse helpers importable when run as script
+    _ = parse_host_port
+    Tunnel().create_connection()

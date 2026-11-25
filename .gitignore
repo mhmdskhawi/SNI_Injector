@@ -1,0 +1,22 @@
+# secrets / local config
+settings.ini
+logs
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# build / local binaries (keep source scripts)
+*.pem
+*.key

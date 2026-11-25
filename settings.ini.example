@@ -1,0 +1,21 @@
+[settings]
+local_ip = 127.0.0.1
+listen_port = 9092
+mode = ssh
+
+[ssh]
+host = YOUR_SERVER_IP_OR_HOST
+username = YOUR_SSH_USER
+password = YOUR_SSH_PASSWORD
+port = 443
+plain_port = 22
+
+[sni]
+server_name = YOUR_BUG_HOST_SNI
+
+[ssl]
+# required | optional | none  (none = lab only, MITM-vulnerable)
+verify = none
+cert_pin_sha256 =
+verify_hostname =
+ca_file =
